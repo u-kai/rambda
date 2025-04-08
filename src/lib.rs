@@ -53,25 +53,30 @@ pub async fn rambda_handler<G: RuntimeGenerator, I: Fn() -> String>(
 
 pub async fn invocation_next_handler(
     map: RequestMap,
-    aws_request_id: &AWSRequestId,
+    aws_request_id: AWSRequestId,
 ) -> Option<RequestEvent> {
+    while map.r_map.lock().await.get(&aws_request_id).is_none() {
+        // runtime側からのレスポンスを待つ
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
     // runtime側にリクエストを送信
-    match map.get_response(aws_request_id).await {
+    match map.get_response(aws_request_id.clone()).await {
         Some(request_event) => Some(request_event),
-        None => None,
+        None => panic!("request channel closed, removing request"),
     }
 }
 
 pub async fn invocation_response_handler(
     map: ResponseMap,
-    aws_request_id: &AWSRequestId,
+    aws_request_id: AWSRequestId,
     event_response: EventResponse,
 ) -> Result<(), String> {
     // runtime側からのレスポンスを待つ
     // rambda側にレスポンスを送信
-    map.send_response(aws_request_id, event_response)
+    map.send_response(aws_request_id.clone(), event_response)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -84,7 +89,7 @@ mod tests {
     impl RuntimeGenerator for MockRuntimeGenerator {
         async fn generate(&self) -> Result<Runtime, String> {
             let len = self.generated_runtimes.len();
-            let runtime = Runtime::new(RuntimeId(format!("runtime_{}", len)), 8080 + len as u16);
+            let runtime = Runtime::new(RuntimeId(format!("runtime_{}", len)), 8080 + len as u16, 0);
             Ok(runtime)
         }
         async fn kill(&self, _runtime_id: &RuntimeId) -> Result<(), String> {
@@ -96,8 +101,8 @@ mod tests {
             }
         }
     }
-    fn new_mock_gen_id(id: &str) -> impl Fn() -> String {
-        let id = id.to_string();
+    fn new_mock_gen_id(id: String) -> impl Fn() -> String {
+        let id = id;
         move || id.clone()
     }
     #[tokio::test]
@@ -108,21 +113,21 @@ mod tests {
         for i in 0..100 {
             let request_event =
                 RequestEvent(Value::String(format!("request_event_{}", i).to_string()));
+
+            let id = format!("test_{}", i);
             let manager = RuntimeManager::new(MockRuntimeGenerator {
                 generated_runtimes: vec![],
             });
-
-            let id = format!("test_{}", i);
             let rambda_handler_result = rambda_handler(
                 request_event.clone(),
                 request_map.clone(),
                 response_map.clone(),
                 manager.clone(),
-                new_mock_gen_id(&id),
+                new_mock_gen_id(id.clone()),
             );
             let aws_request_id = AWSRequestId(id.clone());
             let wait_invocation_next =
-                invocation_next_handler(request_map.clone(), &aws_request_id);
+                invocation_next_handler(request_map.clone(), aws_request_id.clone());
             let mut response = Map::new();
             response.insert(
                 "key".to_string(),
@@ -130,7 +135,7 @@ mod tests {
             );
             let wait_invocation_response = invocation_response_handler(
                 response_map.clone(),
-                &aws_request_id,
+                aws_request_id,
                 EventResponse(response.clone()),
             );
             let (rambda_handler_result, wait_invocation_next, wait_invocation_response) = tokio::join!(
@@ -142,6 +147,7 @@ mod tests {
             assert_eq!(wait_invocation_next, Some(request_event));
             assert_eq!(wait_invocation_response, Ok(()));
         }
+        assert_eq!(request_map.r_map.lock().await.len(), 0);
     }
 }
 
@@ -187,12 +193,13 @@ impl RequestMap {
         }
     }
 
-    pub async fn get_response(&self, aws_request_id: &AWSRequestId) -> Option<RequestEvent> {
-        if let Some(rx) = self.r_map.lock().await.get_mut(aws_request_id) {
+    pub async fn get_response(&self, aws_request_id: AWSRequestId) -> Option<RequestEvent> {
+        let mut r_map = self.r_map.lock().await;
+        if let Some(rx) = r_map.get_mut(&aws_request_id) {
             match rx.recv().await {
                 Some(resp) => Some(resp),
                 None => {
-                    self.r_map.lock().await.remove(aws_request_id);
+                    self.r_map.lock().await.remove(&aws_request_id);
                     None
                 }
             }
@@ -248,10 +255,10 @@ impl ResponseMap {
     }
     pub async fn send_response(
         &self,
-        aws_request_id: &AWSRequestId,
+        aws_request_id: AWSRequestId,
         response: EventResponse,
     ) -> Result<(), String> {
-        let tx = self.t_map.lock().await.remove(aws_request_id);
+        let tx = self.t_map.lock().await.remove(&aws_request_id);
         if let Some(tx) = tx {
             tx.send(response)
                 .map_err(|_| "Failed to send response".to_string())
@@ -266,6 +273,35 @@ pub struct RuntimeManager<G: RuntimeGenerator> {
     runtime_list: Arc<Mutex<RuntimeList>>,
 }
 
+pub struct RuntimeProcessGenerator {
+    assign_ports: Vec<u16>,
+}
+impl RuntimeProcessGenerator {
+    const BASE_PORT: u16 = 8080;
+    pub fn new(assign_ports: Vec<u16>) -> Self {
+        Self { assign_ports }
+    }
+}
+
+impl RuntimeGenerator for RuntimeProcessGenerator {
+    async fn generate(&self) -> Result<Runtime, String> {
+        let port = Self::BASE_PORT + self.assign_ports.len() as u16;
+        let start_time = chrono::Utc::now().timestamp_millis() as u64;
+        let runtime = Runtime::new(RuntimeId(format!("runtime_{}", port)), port, start_time);
+
+        Ok(runtime)
+    }
+    async fn kill(&self, _runtime_id: &RuntimeId) -> Result<(), String> {
+        // ここで実際にRuntimeをkillする処理を書く
+        Ok(())
+    }
+    fn clone(&self) -> Self {
+        Self {
+            assign_ports: self.assign_ports.clone(),
+        }
+    }
+}
+
 impl<G: RuntimeGenerator> RuntimeManager<G> {
     pub fn new(generator: G) -> Self {
         Self {
@@ -278,6 +314,18 @@ impl<G: RuntimeGenerator> RuntimeManager<G> {
             generator: self.generator.clone(),
             runtime_list: self.runtime_list.clone(),
         }
+    }
+    pub async fn gc_loop(&self) {
+        //tokio::spawn(async move {
+        //    loop {
+        //        // runtimeのGC処理
+        //        let mut runtime_list = self.clone().runtime_list.lock().await;
+        //        // ここでruntimeのGC処理を行う
+        //        // 例えば、idleなruntimeを削除するなど
+        //        // runtime_list.remove_idle_runtimes();
+        //        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        //    }
+        //});
     }
 
     async fn generate(&mut self) -> Result<Runtime, String> {
@@ -298,7 +346,7 @@ impl<G: RuntimeGenerator> RuntimeManager<G> {
     //}
 
     async fn kill(&mut self, runtime_id: &RuntimeId) {
-        self.generator.kill(runtime_id).await;
+        self.generator.kill(runtime_id).await.unwrap();
         self.runtime_list.lock().await.remove(runtime_id);
     }
 }
@@ -321,10 +369,6 @@ impl RuntimeList {
         self.0.push(runtime);
     }
 
-    //fn find_idle(&self) -> Option<&Runtime> {
-    //    self.0.iter().find(|r| r.status == RuntimeStatus::Idle)
-    //}
-
     fn remove(&mut self, runtime_id: &RuntimeId) {
         self.0.retain(|r| r.id != *runtime_id);
     }
@@ -334,18 +378,18 @@ impl RuntimeList {
 pub struct Runtime {
     id: RuntimeId,
     port: u16,
+    // time
+    start: u64,
 }
 impl Runtime {
-    pub fn new(id: RuntimeId, port: u16) -> Self {
-        Self { id, port }
+    pub fn new(id: RuntimeId, port: u16, start: u64) -> Self {
+        Self { id, port, start }
+    }
+    fn is_expired(&self) -> bool {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        now - self.start > 60 * 1000
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeId(String);
-
-//#[derive(Debug, Clone, PartialEq, Eq)]
-//enum RuntimeStatus {
-//    Busy,
-//    Idle,
-//}
