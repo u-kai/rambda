@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct RequestEvent(pub Value);
-
 #[derive(Debug, Serialize)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum InvocationResponse {
@@ -19,8 +16,8 @@ pub struct StatusResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorResponse {
-    error_message: String,
-    error_type: String,
+    pub error_message: String,
+    pub error_type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -38,5 +35,8 @@ pub struct ErrorRequest {
     stack_trace: String,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Deserialize)]
+pub struct RequestEvent(pub Map<String, Value>);
+
+#[derive(Debug, Serialize, PartialEq, Deserialize)]
 pub struct EventResponse(pub Map<String, Value>);

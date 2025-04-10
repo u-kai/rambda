@@ -7,7 +7,7 @@ pub mod api;
 pub mod types;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AWSRequestId(String);
+pub struct AWSRequestId(pub String);
 
 // runtimeのGCは別のプロセスでやった方が良いかも
 // なぜなら起動したらruntimeが必ずしもrambda_handler内で取り扱っているrequest_idを消費するとは限らないから
@@ -27,40 +27,38 @@ pub struct AWSRequestId(String);
 // find_idleとかもいらないってことかな?とりあえず送信してnextで待っているやつがいないのであればすぐにgenerateする感じで良いと思う
 pub async fn rambda_handler<G: RuntimeGenerator, I: Fn() -> String>(
     request_event: RequestEvent,
-    request_map: RequestMap,
+    request_chan: RequestChannel,
     response_map: ResponseMap,
     mut runtime_manager: RuntimeManager<G>,
     gen_id: I,
 ) -> EventResponse {
     let aws_request_id = AWSRequestId(gen_id());
 
-    request_map.add_new_request(aws_request_id.clone()).await;
     // runtime側にリクエストを送信
-    while let Err(SendRequestEventToChannelError::FailedToSend) = request_map
+    while let Err(SendRequestEventToChannelError::FailedToSend) = request_chan
         .send_request(&aws_request_id, request_event.clone())
         .await
     {
+        println!("request channel is full, waiting for runtime to process");
         // runtimeがないので新しく生成する
         runtime_manager.generate().await.unwrap();
     }
 
+    println!("request channel sent");
     response_map.add_new_request(aws_request_id.clone()).await;
 
     // runtime側からのレスポンスを待つ
+    println!("waiting for response");
     let response = response_map.get_response(&aws_request_id).await.unwrap();
+    println!("response: {:?}", response);
     response
 }
 
 pub async fn invocation_next_handler(
-    map: RequestMap,
-    aws_request_id: AWSRequestId,
-) -> Option<RequestEvent> {
-    while map.r_map.lock().await.get(&aws_request_id).is_none() {
-        // runtime側からのレスポンスを待つ
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
-    // runtime側にリクエストを送信
-    match map.get_response(aws_request_id.clone()).await {
+    mut chan: RequestChannel,
+) -> Option<(AWSRequestId, RequestEvent)> {
+    // runtime側にリクエストを返信
+    match chan.recv_request().await {
         Some(request_event) => Some(request_event),
         None => panic!("request channel closed, removing request"),
     }
@@ -107,12 +105,16 @@ mod tests {
     }
     #[tokio::test]
     async fn test_rambda_handler() {
-        let request_map = RequestMap::new();
+        let request_map = RequestChannel::new();
         let response_map = ResponseMap::new();
 
         for i in 0..100 {
-            let request_event =
-                RequestEvent(Value::String(format!("request_event_{}", i).to_string()));
+            let mut event = Map::new();
+            event.insert(
+                "key".to_string(),
+                Value::String(format!("event_{}", i).to_string()),
+            );
+            let request_event = RequestEvent(event);
 
             let id = format!("test_{}", i);
             let manager = RuntimeManager::new(MockRuntimeGenerator {
@@ -126,8 +128,7 @@ mod tests {
                 new_mock_gen_id(id.clone()),
             );
             let aws_request_id = AWSRequestId(id.clone());
-            let wait_invocation_next =
-                invocation_next_handler(request_map.clone(), aws_request_id.clone());
+            let wait_invocation_next = invocation_next_handler(request_map.clone());
             let mut response = Map::new();
             response.insert(
                 "key".to_string(),
@@ -135,7 +136,7 @@ mod tests {
             );
             let wait_invocation_response = invocation_response_handler(
                 response_map.clone(),
-                aws_request_id,
+                aws_request_id.clone(),
                 EventResponse(response.clone()),
             );
             let (rambda_handler_result, wait_invocation_next, wait_invocation_response) = tokio::join!(
@@ -144,16 +145,15 @@ mod tests {
                 wait_invocation_response
             );
             assert_eq!(rambda_handler_result, EventResponse(response));
-            assert_eq!(wait_invocation_next, Some(request_event));
+            assert_eq!(wait_invocation_next, Some((aws_request_id, request_event)));
             assert_eq!(wait_invocation_response, Ok(()));
         }
-        assert_eq!(request_map.r_map.lock().await.len(), 0);
     }
 }
 
-pub struct RequestMap {
-    t_map: Arc<Mutex<HashMap<AWSRequestId, mpsc::Sender<RequestEvent>>>>,
-    r_map: Arc<Mutex<HashMap<AWSRequestId, mpsc::Receiver<RequestEvent>>>>,
+pub struct RequestChannel {
+    tx: mpsc::Sender<(AWSRequestId, RequestEvent)>,
+    rx: Arc<Mutex<mpsc::Receiver<(AWSRequestId, RequestEvent)>>>,
 }
 
 pub enum SendRequestEventToChannelError {
@@ -161,17 +161,13 @@ pub enum SendRequestEventToChannelError {
     SenderAlreadyTaken,
     RequestIdNotFound,
 }
-impl RequestMap {
+impl RequestChannel {
     pub fn new() -> Self {
-        RequestMap {
-            r_map: Arc::new(Mutex::new(HashMap::new())),
-            t_map: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-    pub async fn add_new_request(&self, aws_request_id: AWSRequestId) {
         let (tx, rx) = mpsc::channel(1);
-        self.t_map.lock().await.insert(aws_request_id.clone(), tx);
-        self.r_map.lock().await.insert(aws_request_id, rx);
+        RequestChannel {
+            tx,
+            rx: Arc::new(Mutex::new(rx)),
+        }
     }
 
     pub async fn send_request(
@@ -179,40 +175,28 @@ impl RequestMap {
         aws_request_id: &AWSRequestId,
         resp: RequestEvent,
     ) -> Result<(), SendRequestEventToChannelError> {
-        if let Some(request_mpsc) = self.t_map.lock().await.get_mut(aws_request_id) {
-            match request_mpsc.try_send(resp) {
-                Ok(_) => Ok(()),
-                Err(_) => {
-                    // bufferが1なので、受信側が受信していない場合はErrになる
-                    // 再度senderをセットする
-                    Err(SendRequestEventToChannelError::FailedToSend)
-                }
+        match self.tx.try_send((aws_request_id.clone(), resp)) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // bufferが1なので、受信側が受信していない場合はErrになる
+                // 再度senderをセットする
+                Err(SendRequestEventToChannelError::FailedToSend)
             }
-        } else {
-            Err(SendRequestEventToChannelError::RequestIdNotFound)
         }
     }
 
-    pub async fn get_response(&self, aws_request_id: AWSRequestId) -> Option<RequestEvent> {
-        let mut r_map = self.r_map.lock().await;
-        if let Some(rx) = r_map.get_mut(&aws_request_id) {
-            match rx.recv().await {
-                Some(resp) => Some(resp),
-                None => {
-                    self.r_map.lock().await.remove(&aws_request_id);
-                    None
-                }
-            }
-        } else {
-            None
+    pub async fn recv_request(&mut self) -> Option<(AWSRequestId, RequestEvent)> {
+        match self.rx.lock().await.recv().await {
+            Some(resp) => Some(resp),
+            None => None,
         }
     }
 }
-impl Clone for RequestMap {
+impl Clone for RequestChannel {
     fn clone(&self) -> Self {
-        RequestMap {
-            r_map: self.r_map.clone(),
-            t_map: self.t_map.clone(),
+        RequestChannel {
+            tx: self.tx.clone(),
+            rx: self.rx.clone(),
         }
     }
 }
@@ -276,6 +260,7 @@ pub struct RuntimeManager<G: RuntimeGenerator> {
 pub struct RuntimeProcessGenerator {
     assign_ports: Vec<u16>,
 }
+
 impl RuntimeProcessGenerator {
     const BASE_PORT: u16 = 8080;
     pub fn new(assign_ports: Vec<u16>) -> Self {
@@ -392,4 +377,4 @@ impl Runtime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RuntimeId(String);
+pub struct RuntimeId(pub String);
