@@ -40,3 +40,9 @@ pub struct RequestEvent(pub Map<String, Value>);
 
 #[derive(Debug, Serialize, PartialEq, Deserialize)]
 pub struct EventResponse(pub Map<String, Value>);
+
+impl From<RequestEvent> for EventResponse {
+    fn from(event: RequestEvent) -> Self {
+        EventResponse(event.0)
+    }
+}

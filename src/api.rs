@@ -1,14 +1,13 @@
-use std::convert::Infallible;
-
 use axum::{
     Json,
     body::Body,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
+use log::debug;
 
 use crate::{
-    RequestChannel, ResponseMap, Runtime, RuntimeGenerator, RuntimeManager,
+    RequestChannel, ResponseMap, RuntimeGenerator, RuntimeManager, RuntimeProcessGenerator,
     invocation_next_handler, invocation_response_handler, rambda_handler,
     types::{
         ErrorResponse, EventResponse, InvocationNextResponse, InvocationResponse, RequestEvent,
@@ -22,35 +21,16 @@ pub struct AppState<G: RuntimeGenerator> {
     runtime_manager: RuntimeManager<G>,
 }
 
-pub struct MockRuntimeGenerator;
-
-impl RuntimeGenerator for MockRuntimeGenerator {
-    async fn generate(&self) -> Result<Runtime, String> {
-        Ok(Runtime::new(crate::RuntimeId("hello".to_string()), 8000, 0))
-    }
-    async fn kill(&self, runtime_id: &crate::RuntimeId) -> Result<(), String> {
-        Ok(())
-    }
-    fn clone(&self) -> Self {
-        MockRuntimeGenerator
-    }
-}
-impl Clone for MockRuntimeGenerator {
-    fn clone(&self) -> Self {
-        MockRuntimeGenerator
-    }
-}
-
-impl AppState<MockRuntimeGenerator> {
-    pub fn new() -> Self {
+impl AppState<RuntimeProcessGenerator> {
+    pub fn new(manager: RuntimeManager<RuntimeProcessGenerator>) -> Self {
         AppState {
-            request_chan: RequestChannel::new(),
-            response_map: ResponseMap::new(),
-            runtime_manager: RuntimeManager::new(MockRuntimeGenerator),
+            request_chan: RequestChannel::default(),
+            response_map: ResponseMap::default(),
+            runtime_manager: manager,
         }
     }
 }
-impl Clone for AppState<MockRuntimeGenerator> {
+impl Clone for AppState<RuntimeProcessGenerator> {
     fn clone(&self) -> Self {
         AppState {
             request_chan: self.request_chan.clone(),
@@ -60,15 +40,16 @@ impl Clone for AppState<MockRuntimeGenerator> {
     }
 }
 
-//#[axum::debug_handler]
 pub async fn rambda<G: RuntimeGenerator>(
     State(state): State<AppState<G>>,
     Json(event): Json<RequestEvent>,
 ) -> Json<EventResponse> {
-    println!("event: {:?}", event);
+    debug!("rambda event: {:?}", event);
+
     fn gen_id() -> String {
         uuid::Uuid::new_v4().to_string()
     }
+
     let response = rambda_handler(
         event,
         state.request_chan,
@@ -83,22 +64,18 @@ pub async fn rambda<G: RuntimeGenerator>(
 pub async fn invocation_next<G: RuntimeGenerator>(
     State(state): State<AppState<G>>,
 ) -> (HeaderMap, Json<InvocationNextResponse>) {
-    println!("invocation_next");
+    debug!("invocation_next");
+
     let response = invocation_next_handler(state.request_chan).await.unwrap();
+    let aws_request_id = response.0;
+    let request_event = response.1;
+
     let mut header = HeaderMap::new();
     header.insert(
         "Lambda-Runtime-Aws-Request-Id",
-        response.0.0.parse().unwrap(),
+        aws_request_id.0.parse().unwrap(),
     );
     header.insert("Lambda-Runtime-Trace-Id", "trace-id".parse().unwrap());
-    header.insert(
-        "Lambda-Runtime-Client-Context",
-        r#"{"key":"value"}"#.parse().unwrap(),
-    );
-    header.insert(
-        "Lambda-Runtime-Cognito-Identity",
-        r#"{"key":"value"}"#.parse().unwrap(),
-    );
     header.insert(
         "Lambda-Runtime-Invoked-Function-Arn",
         "arn:aws:lambda:us-east-1:123456789012:function:my-function"
@@ -106,11 +83,10 @@ pub async fn invocation_next<G: RuntimeGenerator>(
             .unwrap(),
     );
     header.insert("Lambda-Runtime-Deadline-Ms", "3000".parse().unwrap());
+
     (
         header,
-        Json(InvocationNextResponse::EventResponse(EventResponse(
-            response.1.0,
-        ))),
+        Json(InvocationNextResponse::EventResponse(request_event.into())),
     )
 }
 
@@ -119,7 +95,7 @@ pub async fn invocation_response<G: RuntimeGenerator>(
     Path(aws_request_id): Path<String>,
     Json(event_response): Json<Option<EventResponse>>,
 ) -> (StatusCode, Json<InvocationResponse>) {
-    println!("invocation response aws_request_id: {}", aws_request_id);
+    debug!("invocation response aws_request_id: {}", aws_request_id);
     let aws_request_id = crate::AWSRequestId(aws_request_id.clone());
     let send_result = invocation_response_handler(
         state.response_map,
@@ -144,11 +120,12 @@ pub async fn invocation_response<G: RuntimeGenerator>(
     }
 }
 
+// TODO
 pub async fn invocation_error(
     Path(aws_request_id): Path<String>,
-    body: Body,
+    _body: Body,
 ) -> Json<InvocationResponse> {
-    println!("aws_request_id: {}", aws_request_id);
+    debug!("aws_request_id: {}", aws_request_id);
 
     Json(InvocationResponse::Status(StatusResponse {
         status: "OK".to_string(),

@@ -1,6 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{Mutex, mpsc, oneshot};
+use log::debug;
+use tokio::{
+    process::Command,
+    sync::{Mutex, mpsc, oneshot},
+};
 use types::{EventResponse, RequestEvent};
 
 pub mod api;
@@ -9,22 +13,6 @@ pub mod types;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AWSRequestId(pub String);
 
-// runtimeのGCは別のプロセスでやった方が良いかも
-// なぜなら起動したらruntimeが必ずしもrambda_handler内で取り扱っているrequest_idを消費するとは限らないから
-// idleなruntimeがないからruntimeを起動したが、起動中に別のruntimeがidleになり、nextを起動するといったことは全然ありうるから
-// ただ、今思ったのはnextを叩いてrequest_idを割り当てたruntimeがどのruntimeかを知らないと、runtimeのGCってむずくない？
-// でもnextを叩くときにruntime側は別にruntime_idなどは渡さないからどうしよう
-// 定期的に今のリクエスト量と、ランタイムの数を見て、減らしていかないとダメなのかも？
-// idleとbusyの状態を知る術が難しい。。。
-// 例えばinvocation/responseを送ってきたruntimeに対して、idleな状態に直すとかはありかも
-// そうなるとaws_request_idからruntime_idを取得する必要があるが、どうする？?
-// 上に書いている通り、runtimeを起動したからといって、そのruntimeに対して必ずしもrequest_idのリクエストが割当たるのかはわからない
-// そうなるとinvocation_nextやresponseの時にruntime側がruntime_idをrequest_idと一緒に送って欲しいけど、そういう使用ではなかった気がする
-// runtime_idがruntime側から送信されないとなると、制限時間や他のメトリクスからruntimeを管理するしかない
-// ので、そうする
-// send_requestでruntimeがない場合はブロックされると思うので、tryしてダメだったらruntimeを生成するようにする
-// runtimeのGCは制限時間を確認しながら、shutdownを送る
-// find_idleとかもいらないってことかな?とりあえず送信してnextで待っているやつがいないのであればすぐにgenerateする感じで良いと思う
 pub async fn rambda_handler<G: RuntimeGenerator, I: Fn() -> String>(
     request_event: RequestEvent,
     request_chan: RequestChannel,
@@ -39,18 +27,19 @@ pub async fn rambda_handler<G: RuntimeGenerator, I: Fn() -> String>(
         .send_request(&aws_request_id, request_event.clone())
         .await
     {
-        println!("request channel is full, waiting for runtime to process");
-        // runtimeがないので新しく生成する
-        runtime_manager.generate().await.unwrap();
+        debug!("request channel is full, waiting for runtime to process");
+        // runtimeが処理中の場合は、新しいruntimeを生成しておく
+        runtime_manager.init().await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
-    println!("request channel sent");
+    debug!("request channel sent");
     response_map.add_new_request(aws_request_id.clone()).await;
 
     // runtime側からのレスポンスを待つ
-    println!("waiting for response");
+    debug!("waiting for runtime response");
     let response = response_map.get_response(&aws_request_id).await.unwrap();
-    println!("response: {:?}", response);
+    debug!("response: {:?}", response);
     response
 }
 
@@ -69,25 +58,262 @@ pub async fn invocation_response_handler(
     aws_request_id: AWSRequestId,
     event_response: EventResponse,
 ) -> Result<(), String> {
-    // runtime側からのレスポンスを待つ
     // rambda側にレスポンスを送信
     map.send_response(aws_request_id.clone(), event_response)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+
+pub struct RequestChannel {
+    tx: mpsc::Sender<(AWSRequestId, RequestEvent)>,
+    rx: Arc<Mutex<mpsc::Receiver<(AWSRequestId, RequestEvent)>>>,
+}
+
+pub enum SendRequestEventToChannelError {
+    FailedToSend,
+    SenderAlreadyTaken,
+    RequestIdNotFound,
+}
+
+impl Default for RequestChannel {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        RequestChannel {
+            tx,
+            rx: Arc::new(Mutex::new(rx)),
+        }
+    }
+}
+
+impl RequestChannel {
+    pub async fn send_request(
+        &self,
+        aws_request_id: &AWSRequestId,
+        resp: RequestEvent,
+    ) -> Result<(), SendRequestEventToChannelError> {
+        match self.tx.try_send((aws_request_id.clone(), resp)) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // bufferが1なので、受信側が受信していない場合はErrになる
+                Err(SendRequestEventToChannelError::FailedToSend)
+            }
+        }
+    }
+
+    pub async fn recv_request(&mut self) -> Option<(AWSRequestId, RequestEvent)> {
+        self.rx.lock().await.recv().await
+    }
+}
+impl Clone for RequestChannel {
+    fn clone(&self) -> Self {
+        RequestChannel {
+            tx: self.tx.clone(),
+            rx: self.rx.clone(),
+        }
+    }
+}
+
+pub struct ResponseMap {
+    r_map: Arc<Mutex<HashMap<AWSRequestId, oneshot::Receiver<EventResponse>>>>,
+    t_map: Arc<Mutex<HashMap<AWSRequestId, oneshot::Sender<EventResponse>>>>,
+}
+impl Clone for ResponseMap {
+    fn clone(&self) -> Self {
+        ResponseMap {
+            r_map: self.r_map.clone(),
+            t_map: self.t_map.clone(),
+        }
+    }
+}
+impl Default for ResponseMap {
+    fn default() -> Self {
+        ResponseMap {
+            r_map: Arc::new(Mutex::new(HashMap::new())),
+            t_map: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl ResponseMap {
+    pub async fn add_new_request(&self, aws_request_id: AWSRequestId) {
+        let (tx, rx) = oneshot::channel();
+        self.r_map.lock().await.insert(aws_request_id.clone(), rx);
+        self.t_map.lock().await.insert(aws_request_id, tx);
+    }
+    pub async fn get_response(&self, aws_request_id: &AWSRequestId) -> Option<EventResponse> {
+        let rx = self.r_map.lock().await.remove(aws_request_id);
+
+        if let Some(rx) = rx {
+            (rx.await).ok()
+        } else {
+            None
+        }
+    }
+    pub async fn send_response(
+        &self,
+        aws_request_id: AWSRequestId,
+        response: EventResponse,
+    ) -> Result<(), String> {
+        let tx = self.t_map.lock().await.remove(&aws_request_id);
+        if let Some(tx) = tx {
+            tx.send(response)
+                .map_err(|_| "Failed to send response".to_string())
+        } else {
+            Err("Sender already taken".to_string())
+        }
+    }
+}
+
+pub struct RuntimeManager<G: RuntimeGenerator> {
+    generator: G,
+    runtime_list: Arc<Mutex<RuntimeList>>,
+    lifetime_ms: u64,
+}
+impl<G: RuntimeGenerator> Clone for RuntimeManager<G> {
+    fn clone(&self) -> Self {
+        Self {
+            generator: self.generator.clone(),
+            runtime_list: self.runtime_list.clone(),
+            lifetime_ms: self.lifetime_ms,
+        }
+    }
+}
+
+pub struct RuntimeProcessGenerator {
+    cmd: String,
+    args: Vec<String>,
+}
+
+impl RuntimeProcessGenerator {
+    pub fn new(cmd: impl Into<String>, args: Vec<impl Into<String>>) -> Self {
+        Self {
+            cmd: cmd.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl RuntimeGenerator for RuntimeProcessGenerator {
+    async fn init(&self) -> Result<Runtime, String> {
+        let start_time = chrono::Utc::now().timestamp_millis() as u64;
+
+        let child = Command::new(self.cmd.as_str())
+            .args(&self.args)
+            .env("AWS_LAMBDA_RUNTIME_API", "localhost:9001")
+            .spawn()
+            .map_err(|e| format!("Failed to spawn process: {}", e))?;
+        let runtime = Runtime::new(RuntimeId(child.id().unwrap().to_string()), start_time);
+        debug!("spawned process: {:?}", runtime.id);
+
+        Ok(runtime)
+    }
+
+    async fn kill(&self, runtime_id: &RuntimeId) -> Result<(), String> {
+        Command::new("kill")
+            .args(["-9", &runtime_id.0])
+            .spawn()
+            .map_err(|e| format!("Failed to kill process: {}", e))?
+            .wait()
+            .await
+            .map_err(|e| format!("Failed to wait for process: {}", e))?;
+        debug!("killed process: {:?}", runtime_id);
+        Ok(())
+    }
+
+    fn clone(&self) -> Self {
+        Self {
+            cmd: self.cmd.clone(),
+            args: self.args.clone(),
+        }
+    }
+}
+
+impl<G: RuntimeGenerator> RuntimeManager<G> {
+    pub fn new(generator: G, lifetime_ms: u64) -> Self {
+        Self {
+            generator,
+            runtime_list: Arc::new(Mutex::new(RuntimeList::new())),
+            lifetime_ms,
+        }
+    }
+    pub async fn gc(&mut self) {
+        let expires = self.runtime_list.lock().await.0.clone();
+        let lifetime = self.lifetime_ms;
+        let expires = expires
+            .iter()
+            .filter(|r| r.start + lifetime < chrono::Utc::now().timestamp_millis() as u64);
+        for runtime in expires {
+            self.kill(&runtime.id).await;
+        }
+        // もしruntimeが一つもなければ、再度生成する
+        if self.runtime_list.lock().await.0.is_empty() {
+            self.init().await.unwrap();
+        }
+        debug!("process num: {:?}", self.runtime_list.lock().await.0.len());
+    }
+
+    pub async fn init(&mut self) -> Result<Runtime, String> {
+        let runtime = self.generator.init().await?;
+        self.runtime_list.lock().await.add(runtime.clone());
+        Ok(runtime)
+    }
+
+    async fn kill(&mut self, runtime_id: &RuntimeId) {
+        self.generator.kill(runtime_id).await.unwrap();
+        self.runtime_list.lock().await.remove(runtime_id);
+    }
+}
+
+pub trait RuntimeGenerator {
+    fn init(&self) -> impl Future<Output = Result<Runtime, String>>;
+    fn kill(&self, runtime_id: &RuntimeId) -> impl Future<Output = Result<(), String>>;
+    fn clone(&self) -> Self;
+}
+
+#[derive(Clone)]
+struct RuntimeList(Vec<Runtime>);
+
+impl RuntimeList {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn add(&mut self, runtime: Runtime) {
+        self.0.push(runtime);
+    }
+
+    fn remove(&mut self, runtime_id: &RuntimeId) {
+        self.0.retain(|r| r.id != *runtime_id);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Runtime {
+    id: RuntimeId,
+    // time
+    start: u64,
+}
+impl Runtime {
+    pub fn new(id: RuntimeId, start: u64) -> Self {
+        Self { id, start }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeId(pub String);
+
 #[cfg(test)]
 mod tests {
-    use serde_json::{Map, Value};
-
     use super::*;
+    use serde_json::{Map, Value};
     struct MockRuntimeGenerator {
-        generated_runtimes: Vec<Runtime>,
+        initd_runtimes: Vec<Runtime>,
     }
     impl RuntimeGenerator for MockRuntimeGenerator {
-        async fn generate(&self) -> Result<Runtime, String> {
-            let len = self.generated_runtimes.len();
-            let runtime = Runtime::new(RuntimeId(format!("runtime_{}", len)), 8080 + len as u16, 0);
+        async fn init(&self) -> Result<Runtime, String> {
+            let len = self.initd_runtimes.len();
+            let runtime = Runtime::new(RuntimeId(format!("runtime_{}", len)), 0);
             Ok(runtime)
         }
         async fn kill(&self, _runtime_id: &RuntimeId) -> Result<(), String> {
@@ -95,7 +321,7 @@ mod tests {
         }
         fn clone(&self) -> Self {
             Self {
-                generated_runtimes: self.generated_runtimes.clone(),
+                initd_runtimes: self.initd_runtimes.clone(),
             }
         }
     }
@@ -105,8 +331,8 @@ mod tests {
     }
     #[tokio::test]
     async fn test_rambda_handler() {
-        let request_map = RequestChannel::new();
-        let response_map = ResponseMap::new();
+        let request_map = RequestChannel::default();
+        let response_map = ResponseMap::default();
 
         for i in 0..100 {
             let mut event = Map::new();
@@ -117,9 +343,12 @@ mod tests {
             let request_event = RequestEvent(event);
 
             let id = format!("test_{}", i);
-            let manager = RuntimeManager::new(MockRuntimeGenerator {
-                generated_runtimes: vec![],
-            });
+            let manager = RuntimeManager::new(
+                MockRuntimeGenerator {
+                    initd_runtimes: vec![],
+                },
+                0,
+            );
             let rambda_handler_result = rambda_handler(
                 request_event.clone(),
                 request_map.clone(),
@@ -150,231 +379,3 @@ mod tests {
         }
     }
 }
-
-pub struct RequestChannel {
-    tx: mpsc::Sender<(AWSRequestId, RequestEvent)>,
-    rx: Arc<Mutex<mpsc::Receiver<(AWSRequestId, RequestEvent)>>>,
-}
-
-pub enum SendRequestEventToChannelError {
-    FailedToSend,
-    SenderAlreadyTaken,
-    RequestIdNotFound,
-}
-impl RequestChannel {
-    pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(1);
-        RequestChannel {
-            tx,
-            rx: Arc::new(Mutex::new(rx)),
-        }
-    }
-
-    pub async fn send_request(
-        &self,
-        aws_request_id: &AWSRequestId,
-        resp: RequestEvent,
-    ) -> Result<(), SendRequestEventToChannelError> {
-        match self.tx.try_send((aws_request_id.clone(), resp)) {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                // bufferが1なので、受信側が受信していない場合はErrになる
-                // 再度senderをセットする
-                Err(SendRequestEventToChannelError::FailedToSend)
-            }
-        }
-    }
-
-    pub async fn recv_request(&mut self) -> Option<(AWSRequestId, RequestEvent)> {
-        match self.rx.lock().await.recv().await {
-            Some(resp) => Some(resp),
-            None => None,
-        }
-    }
-}
-impl Clone for RequestChannel {
-    fn clone(&self) -> Self {
-        RequestChannel {
-            tx: self.tx.clone(),
-            rx: self.rx.clone(),
-        }
-    }
-}
-
-pub struct ResponseMap {
-    r_map: Arc<Mutex<HashMap<AWSRequestId, oneshot::Receiver<EventResponse>>>>,
-    t_map: Arc<Mutex<HashMap<AWSRequestId, oneshot::Sender<EventResponse>>>>,
-}
-impl Clone for ResponseMap {
-    fn clone(&self) -> Self {
-        ResponseMap {
-            r_map: self.r_map.clone(),
-            t_map: self.t_map.clone(),
-        }
-    }
-}
-
-impl ResponseMap {
-    pub fn new() -> Self {
-        ResponseMap {
-            r_map: Arc::new(Mutex::new(HashMap::new())),
-            t_map: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-    pub async fn add_new_request(&self, aws_request_id: AWSRequestId) {
-        let (tx, rx) = oneshot::channel();
-        self.r_map.lock().await.insert(aws_request_id.clone(), rx);
-        self.t_map.lock().await.insert(aws_request_id, tx);
-    }
-    pub async fn get_response(&self, aws_request_id: &AWSRequestId) -> Option<EventResponse> {
-        let rx = self.r_map.lock().await.remove(aws_request_id);
-        if let Some(rx) = rx {
-            match rx.await {
-                Ok(resp) => Some(resp),
-                Err(_) => None,
-            }
-        } else {
-            None
-        }
-    }
-    pub async fn send_response(
-        &self,
-        aws_request_id: AWSRequestId,
-        response: EventResponse,
-    ) -> Result<(), String> {
-        let tx = self.t_map.lock().await.remove(&aws_request_id);
-        if let Some(tx) = tx {
-            tx.send(response)
-                .map_err(|_| "Failed to send response".to_string())
-        } else {
-            Err("Sender already taken".to_string())
-        }
-    }
-}
-
-pub struct RuntimeManager<G: RuntimeGenerator> {
-    generator: G,
-    runtime_list: Arc<Mutex<RuntimeList>>,
-}
-
-pub struct RuntimeProcessGenerator {
-    assign_ports: Vec<u16>,
-}
-
-impl RuntimeProcessGenerator {
-    const BASE_PORT: u16 = 8080;
-    pub fn new(assign_ports: Vec<u16>) -> Self {
-        Self { assign_ports }
-    }
-}
-
-impl RuntimeGenerator for RuntimeProcessGenerator {
-    async fn generate(&self) -> Result<Runtime, String> {
-        let port = Self::BASE_PORT + self.assign_ports.len() as u16;
-        let start_time = chrono::Utc::now().timestamp_millis() as u64;
-        let runtime = Runtime::new(RuntimeId(format!("runtime_{}", port)), port, start_time);
-
-        Ok(runtime)
-    }
-    async fn kill(&self, _runtime_id: &RuntimeId) -> Result<(), String> {
-        // ここで実際にRuntimeをkillする処理を書く
-        Ok(())
-    }
-    fn clone(&self) -> Self {
-        Self {
-            assign_ports: self.assign_ports.clone(),
-        }
-    }
-}
-
-impl<G: RuntimeGenerator> RuntimeManager<G> {
-    pub fn new(generator: G) -> Self {
-        Self {
-            generator,
-            runtime_list: Arc::new(Mutex::new(RuntimeList::new())),
-        }
-    }
-    pub fn clone(&self) -> Self {
-        Self {
-            generator: self.generator.clone(),
-            runtime_list: self.runtime_list.clone(),
-        }
-    }
-    pub async fn gc_loop(&self) {
-        //tokio::spawn(async move {
-        //    loop {
-        //        // runtimeのGC処理
-        //        let mut runtime_list = self.clone().runtime_list.lock().await;
-        //        // ここでruntimeのGC処理を行う
-        //        // 例えば、idleなruntimeを削除するなど
-        //        // runtime_list.remove_idle_runtimes();
-        //        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-        //    }
-        //});
-    }
-
-    async fn generate(&mut self) -> Result<Runtime, String> {
-        let runtime = self.generator.generate().await?;
-        self.runtime_list.lock().await.add(runtime.clone());
-        Ok(runtime)
-    }
-
-    //fn find_idle(&self) -> Option<Runtime> {
-    //    let runtime_list = self.runtime_list.lock().unwrap();
-    //    runtime_list.find_idle().cloned()
-    //}
-    //fn idle(&mut self, runtime_id: &RuntimeId) {
-    //    let mut runtime_list = self.runtime_list.lock().unwrap();
-    //    if let Some(runtime) = runtime_list.0.iter_mut().find(|r| r.id == *runtime_id) {
-    //        runtime.set_status(RuntimeStatus::Idle);
-    //    }
-    //}
-
-    async fn kill(&mut self, runtime_id: &RuntimeId) {
-        self.generator.kill(runtime_id).await.unwrap();
-        self.runtime_list.lock().await.remove(runtime_id);
-    }
-}
-
-pub trait RuntimeGenerator {
-    async fn generate(&self) -> Result<Runtime, String>;
-    async fn kill(&self, runtime_id: &RuntimeId) -> Result<(), String>;
-    fn clone(&self) -> Self;
-}
-
-#[derive(Clone)]
-struct RuntimeList(Vec<Runtime>);
-
-impl RuntimeList {
-    fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    fn add(&mut self, runtime: Runtime) {
-        self.0.push(runtime);
-    }
-
-    fn remove(&mut self, runtime_id: &RuntimeId) {
-        self.0.retain(|r| r.id != *runtime_id);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Runtime {
-    id: RuntimeId,
-    port: u16,
-    // time
-    start: u64,
-}
-impl Runtime {
-    pub fn new(id: RuntimeId, port: u16, start: u64) -> Self {
-        Self { id, port, start }
-    }
-    fn is_expired(&self) -> bool {
-        let now = chrono::Utc::now().timestamp_millis() as u64;
-        now - self.start > 60 * 1000
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RuntimeId(pub String);
